@@ -1,0 +1,103 @@
+name: build-mesa
+
+# Builds Termux's mesa (packages/mesa of termux/termux-packages, pinned to the
+# commit that bumped it to 26.2.6) for aarch64 with this repo's patches:
+#   variant "debug": patches/*.patch except patches/fix-*.patch
+#   variant "fix":   all patches/*.patch (debug instrumentation + fix-*.patch)
+# Artifacts per variant: the .deb files, and a small tarball with just
+# libvulkan_freedreno.so + an ICD json for side-by-side testing.
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # termux-packages commit "bump(main/mesa): 26.2.6"
+  TERMUX_PACKAGES_REF: 84f9775ddbeda5eb04ceabd7c86f340ac4c9ccbb
+  MESA_VERSION: 26.2.6
+  MESA_SHA256: b9436b3e1a8be76fbd4823dc884f90596ab7c6ac5e1867a305e66ffccfb31a92
+
+jobs:
+  # Fast check (~1 min) that every patch applies to the real 26.2.6 sources,
+  # in the same order the Termux build applies them.
+  patch-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          ref: ${{ env.TERMUX_PACKAGES_REF }}
+          path: termux-packages
+          sparse-checkout: packages/mesa
+      - name: Apply patches to mesa-${{ env.MESA_VERSION }}
+        run: |
+          set -euo pipefail
+          grep -q "TERMUX_PKG_VERSION=\"$MESA_VERSION\"" termux-packages/packages/mesa/build.sh
+          curl -fsSL -o mesa.tar.xz "https://archive.mesa3d.org/mesa-$MESA_VERSION.tar.xz"
+          echo "$MESA_SHA256  mesa.tar.xz" | sha256sum -c
+          tar xf mesa.tar.xz
+          echo "::group::code locations in pristine mesa-$MESA_VERSION (used by NOTES.md)"
+          bash scripts/code-locations.sh "mesa-$MESA_VERSION"
+          echo "::endgroup::"
+          cp patches/*.patch termux-packages/packages/mesa/
+          cd "mesa-$MESA_VERSION"
+          for p in ../termux-packages/packages/mesa/*.patch; do
+            echo "== $(basename "$p")"
+            sed 's|@TERMUX_PREFIX@|/data/data/com.termux/files/usr|g' "$p" | patch -p1 --no-backup-if-mismatch
+          done
+
+  build:
+    needs: patch-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [debug, fix]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: termux/termux-packages
+          ref: ${{ env.TERMUX_PACKAGES_REF }}
+          path: termux-packages
+      - name: Add patches for variant ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          for p in patches/*.patch; do
+            case "$(basename "$p")" in
+              fix-*) [ "${{ matrix.variant }}" = fix ] || continue ;;
+            esac
+            echo "adding $p"
+            cp "$p" termux-packages/packages/mesa/
+          done
+          ls termux-packages/packages/mesa/
+      - name: Load docker image
+        working-directory: termux-packages
+        run: ./scripts/run-docker.sh true
+      - name: Free disk space
+        working-directory: termux-packages
+        env:
+          CI: "true"
+        run: ./scripts/free-space.sh
+      - name: Build mesa (aarch64)
+        working-directory: termux-packages
+        env:
+          CI: "true"
+        run: ./scripts/run-docker.sh ./build-package.sh -I -a aarch64 mesa
+      - name: Collect artifacts
+        run: bash scripts/collect-artifacts.sh "${{ matrix.variant }}" termux-packages/output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-debs-${{ matrix.variant }}
+          path: dist/debs/*.deb
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tmd-vulkan-${{ matrix.variant }}
+          path: dist/tmd-vulkan-${{ matrix.variant }}.tar.gz
+          if-no-files-found: error

@@ -1,0 +1,80 @@
+Turnip/kgsl: fix kgsl_syncobj_merge() dropping fences.
+
+Two branches of kgsl_syncobj_merge() were wrong:
+ 1. ret=TS, sync=TS on a different queue: ret was switched to FD state with
+    ret.fd == -1 and only sync's fence merged into it, so ret's own timestamp
+    was lost (and sync_merge(-1, x) fails, so in release builds the result
+    was "FD -1", i.e. treated as already signalled).
+ 2. ret=TS, sync=FD: kgsl_syncobj_ts_to_fd() was called on 'sync' (an FD-state
+    object; asserts in debug builds) instead of on 'ret', reading a stale
+    queue/timestamp, and the fence in sync->fd was never merged.
+Both cases lead to under-synchronisation (waits that do not wait) or a failed
+submit. The fix converts ret's timestamp first and merges, treating a
+negative fd as "already signalled". kgsl-only; no behaviour change for the
+correct branches.
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 85421ee..ece8a22 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -1071,6 +1071,19 @@ sync_merge_close(const char *name, int fd1, int fd2, bool close_fd2)
+    return fd;
+ }
+ 
++/* Merge two sync_file fds into one, closing fd1 and (if close_fd2) fd2.
++ * A negative fd means "already signalled", so the other fd is the result.
++ */
++static int
++kgsl_merge_fds(int fd1, int fd2, bool close_fd2)
++{
++   if (fd1 < 0)
++      return close_fd2 ? fd2 : (fd2 < 0 ? -1 : os_dupfd_cloexec(fd2));
++   if (fd2 < 0)
++      return fd1;
++   return sync_merge_close("tu_sync", fd1, fd2, close_fd2);
++}
++
+ /* Merges multiple kgsl_syncobjs into a single one which is only signalled
+  * after all submitted syncobjs are signalled
+  */
+@@ -1099,10 +1112,16 @@ kgsl_syncobj_merge(const struct kgsl_syncobj **syncobjs, uint32_t count)
+             if (ret.queue == sync->queue) {
+                ret.timestamp = max_ts(ret.timestamp, sync->timestamp);
+             } else {
+-               ret.state = KGSL_SYNCOBJ_STATE_FD;
++               /* Different queues: both timestamps must become fences.
++                * ret's own timestamp has to be converted too, otherwise the
++                * merge starts from ret.fd == -1 and drops it.
++                */
++               int ret_fd = kgsl_syncobj_ts_to_fd(&ret);
+                int sync_fd = kgsl_syncobj_ts_to_fd(sync);
+-               ret.fd = sync_merge_close("tu_sync", ret.fd, sync_fd, true);
+-               assert(ret.fd >= 0);
++               ret.state = KGSL_SYNCOBJ_STATE_FD;
++               ret.fd = kgsl_merge_fds(ret_fd, sync_fd, true);
++               if (ret.fd < 0)
++                  ret.state = KGSL_SYNCOBJ_STATE_SIGNALED;
+             }
+          } else if (ret.state == KGSL_SYNCOBJ_STATE_FD) {
+             int sync_fd = kgsl_syncobj_ts_to_fd(sync);
+@@ -1118,10 +1137,17 @@ kgsl_syncobj_merge(const struct kgsl_syncobj **syncobjs, uint32_t count)
+             ret.fd = sync_merge_close("tu_sync", ret.fd, sync->fd, false);
+             assert(ret.fd >= 0);
+          } else if (ret.state == KGSL_SYNCOBJ_STATE_TS) {
++            /* sync is an FD syncobj: it is ret (a timestamp) that must be
++             * turned into a fence, and sync->fd (owned by sync, so not
++             * closed) merged into it.  Upstream converted 'sync' instead,
++             * which reads a stale timestamp/queue from an FD-state object and
++             * loses both fences.
++             */
++            int ret_fd = kgsl_syncobj_ts_to_fd(&ret);
+             ret.state = KGSL_SYNCOBJ_STATE_FD;
+-            int sync_fd = kgsl_syncobj_ts_to_fd(sync);
+-            ret.fd = sync_merge_close("tu_sync", ret.fd, sync_fd, true);
+-            assert(ret.fd >= 0);
++            ret.fd = kgsl_merge_fds(ret_fd, sync->fd, false);
++            if (ret.fd < 0)
++               ret.state = KGSL_SYNCOBJ_STATE_SIGNALED;
+          } else {
+             ret = *sync;
+             ret.fd = os_dupfd_cloexec(ret.fd);

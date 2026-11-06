@@ -1,0 +1,482 @@
+TMD-DEBUG instrumentation for termux mesa 26.2.6 (Turnip/kgsl + X11 WSI).
+Not for upstream. Everything is inactive unless TMD_DEBUG=1 (logging) or
+TMD_FORCE_FENCE_WAIT=1 (diagnostic: CPU-wait for the render fence before
+PresentPixmap in every present mode). Log lines start with "TMD " and go to
+stderr and, if set, to the file named by TMD_LOG.
+
+Logged:
+ - result of wsi_drm_check_dma_buf_sync_file_import_export() with the failing
+   step and errno
+ - per swapchain: explicit sync / self-test / dma_buf_semaphore creation, and
+   the X11 parameters (DRI3 modifiers, same_gpu, xwayland, fence wait)
+ - per present (first 20, then every 300th): image path, dma_buf_fd, whether
+   a SYNC_FD was exported from the semaphore and its fence state, the
+   DMA_BUF_IOCTL_IMPORT_SYNC_FILE result, and the dma-buf's fence state right
+   after the import
+ - kgsl IOCTL_KGSL_TIMESTAMP_EVENT failures (silently mapped to fd -1 upstream)
+
+diff --git a/src/freedreno/vulkan/tu_knl_kgsl.cc b/src/freedreno/vulkan/tu_knl_kgsl.cc
+index 08fc5c7..85421ee 100644
+--- a/src/freedreno/vulkan/tu_knl_kgsl.cc
++++ b/src/freedreno/vulkan/tu_knl_kgsl.cc
+@@ -17,6 +17,7 @@
+ #include "msm_kgsl.h"
+ 
+ #include "util/libsync.h"
++#include "util/tmd_debug.h" /* TMD-DEBUG */
+ #include "util/os_file.h"
+ #include "util/timespec.h"
+ #include "util/u_debug.h"
+@@ -726,8 +727,15 @@ timestamp_to_fd(struct tu_queue *queue, uint32_t timestamp)
+    };
+ 
+    int ret = safe_ioctl(queue->device->fd, IOCTL_KGSL_TIMESTAMP_EVENT, &event);
+-   if (ret)
++   if (ret) {
++      /* TMD-DEBUG */
++      static unsigned tmd_fail_count;
++      if (tmd_rate_ok(++tmd_fail_count))
++         tmd_log("kgsl IOCTL_KGSL_TIMESTAMP_EVENT(ts=%u ctx=%u) failed #%u: errno=%d(%s) "
++                 "-> sync fd -1 (treated as signaled!)", timestamp,
++                 queue->msm_queue_id, tmd_fail_count, errno, strerror(errno));
+       return -1;
++   }
+ 
+    return fd;
+ }
+diff --git a/src/util/tmd_debug.h b/src/util/tmd_debug.h
+new file mode 100644
+index 0000000..0c0da11
+--- /dev/null
++++ b/src/util/tmd_debug.h
+@@ -0,0 +1,138 @@
++/*
++ * TMD-DEBUG (termux-mesa-debug): temporary instrumentation for the
++ * "no render fence on presented dma-bufs" investigation.  NOT for upstream.
++ *
++ * Inactive unless the environment variable TMD_DEBUG=1 is set.  Lines go to
++ * stderr and, if TMD_LOG names a file, are appended to that file too.
++ */
++#ifndef TMD_DEBUG_H
++#define TMD_DEBUG_H
++
++#include <errno.h>
++#include <fcntl.h>
++#include <stdarg.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/ioctl.h>
++
++#include "util/libsync.h"
++
++static inline bool
++tmd_enabled(void)
++{
++   static int enabled = -1;
++   if (enabled < 0) {
++      const char *e = getenv("TMD_DEBUG");
++      enabled = (e && strcmp(e, "1") == 0) ? 1 : 0;
++   }
++   return enabled == 1;
++}
++
++/* TMD_FORCE_FENCE_WAIT=1 (independent of TMD_DEBUG): the X11 WSI waits on the
++ * CPU for the frame's render fence before sending PresentPixmap, in every
++ * present mode.  Diagnostic only: if tearing persists with it, the X server
++ * reads/reuses buffers wrongly; if it disappears, render fences are the issue.
++ */
++static inline bool
++tmd_force_fence_wait(void)
++{
++   static int force = -1;
++   if (force < 0) {
++      const char *e = getenv("TMD_FORCE_FENCE_WAIT");
++      force = (e && strcmp(e, "1") == 0) ? 1 : 0;
++   }
++   return force == 1;
++}
++
++/* First 20 events, then every 300th. */
++static inline bool
++tmd_rate_ok(unsigned n)
++{
++   return n <= 20 || n % 300 == 0;
++}
++
++static inline void
++tmd_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
++
++static inline void
++tmd_log(const char *fmt, ...)
++{
++   if (!tmd_enabled())
++      return;
++
++   int saved_errno = errno;
++   static int log_fd = -2;
++   if (log_fd == -2) {
++      const char *path = getenv("TMD_LOG");
++      log_fd = (path && *path) ?
++         open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644) : -1;
++   }
++
++   char buf[1024];
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   int n = snprintf(buf, sizeof(buf), "TMD %ld.%03ld pid=%d: ",
++                    (long)ts.tv_sec, (long)(ts.tv_nsec / 1000000),
++                    (int)getpid());
++   va_list ap;
++   va_start(ap, fmt);
++   int m = vsnprintf(buf + n, sizeof(buf) - n - 1, fmt, ap);
++   va_end(ap);
++   if (m < 0)
++      m = 0;
++   n += m;
++   if (n > (int)sizeof(buf) - 2)
++      n = sizeof(buf) - 2;
++   buf[n++] = '\n';
++
++   ssize_t ignored = write(STDERR_FILENO, buf, n);
++   if (log_fd >= 0)
++      ignored = write(log_fd, buf, n);
++   (void)ignored;
++   errno = saved_errno;
++}
++
++/* Describe a sync_file fd: overall status and up to 4 fences (driver:status). */
++static inline const char *
++tmd_sync_file_desc(int fd, char *out, size_t len)
++{
++   if (fd < 0) {
++      snprintf(out, len, "none(fd=%d)", fd);
++      return out;
++   }
++
++   struct sync_fence_info fences[4];
++   struct sync_file_info info;
++   memset(&info, 0, sizeof(info));
++   if (ioctl(fd, SYNC_IOC_FILE_INFO, &info) != 0) {
++      snprintf(out, len, "FILE_INFO-failed(errno=%d %s)", errno, strerror(errno));
++      return out;
++   }
++   uint32_t total = info.num_fences;
++   uint32_t want = total < 4 ? total : 4;
++   memset(fences, 0, sizeof(fences));
++   memset(&info, 0, sizeof(info));
++   info.num_fences = want;
++   info.sync_fence_info = (uint64_t)(uintptr_t)fences;
++   if (want && ioctl(fd, SYNC_IOC_FILE_INFO, &info) != 0)
++      want = 0;
++
++   int n = snprintf(out, len, "%s n=%u [",
++                    info.status == 1 ? "signaled" :
++                    info.status == 0 ? "PENDING" : "error", total);
++   for (uint32_t i = 0; i < want && n > 0 && (size_t)n < len; i++) {
++      n += snprintf(out + n, len - n, "%s%.32s/%.32s:%s", i ? " " : "",
++                    fences[i].driver_name, fences[i].obj_name,
++                    fences[i].status == 1 ? "signaled" :
++                    fences[i].status == 0 ? "pending" : "error");
++   }
++   if (n > 0 && (size_t)n < len)
++      snprintf(out + n, len - n, "]");
++   return out;
++}
++
++#endif /* TMD_DEBUG_H */
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index 411ee3e..78bd13d 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -22,6 +22,7 @@
+  */
+ 
+ #include "wsi_common_private.h"
++#include "util/tmd_debug.h" /* TMD-DEBUG */
+ #include "wsi_common_entrypoints.h"
+ #include "util/u_debug.h"
+ #include "util/macros.h"
+@@ -2871,6 +2872,31 @@ wsi_common_queue_present(const struct wsi_device *wsi,
+       image->acquired = false;
+       image->present_serial = ++swapchain->present_serial;
+ 
++      /* TMD-DEBUG: one line per (rate-limited) present */
++      {
++         static unsigned tmd_present_count;
++         unsigned tmd_n = ++tmd_present_count;
++         bool tmd_log_this = tmd_enabled() && tmd_rate_ok(tmd_n);
++#ifdef HAVE_LIBDRM
++         tmd_wsi_log_present = tmd_log_this;
++#endif
++         if (tmd_log_this) {
++            const char *tmd_path =
++               wsi->sw ? "cpu/sw" :
++               swapchain->blit.type == WSI_SWAPCHAIN_BUFFER_BLIT ? "prime(buffer-blit)" :
++               swapchain->blit.type == WSI_SWAPCHAIN_IMAGE_BLIT ? "image-blit" :
++               "native";
++            tmd_log("present #%u chain=%p img=%u path=%s dma_buf_fd=%d modifier=0x%llx "
++                    "explicit_sync=%d dma_buf_semaphore=%s present_mode=%d blit_queue=%s",
++                    tmd_n, (void *)swapchain, image_index, tmd_path, image->dma_buf_fd,
++                    (unsigned long long)image->drm_modifier,
++                    swapchain->image_info.explicit_sync,
++                    swapchain->dma_buf_semaphore != VK_NULL_HANDLE ? "yes" : "NULL(no import will happen)",
++                    (int)swapchain->present_mode,
++                    swapchain->blit.queue ? "separate" : "same");
++         }
++      }
++
+       /* If we updated the signal_dma_buf semaphore, extract its syncobj and
+        * attach it to the dma-buf before we present so that the present
+        * implicitly syncs on it.
+diff --git a/src/vulkan/wsi/wsi_common_drm.c b/src/vulkan/wsi/wsi_common_drm.c
+index dbf65b2..95f81c2 100644
+--- a/src/vulkan/wsi/wsi_common_drm.c
++++ b/src/vulkan/wsi/wsi_common_drm.c
+@@ -36,6 +36,7 @@
+ #include "drm-uapi/drm_fourcc.h"
+ #include "drm-uapi/dma-buf.h"
+ #include "util/libsync.h"
++#include "util/tmd_debug.h" /* TMD-DEBUG */
+ 
+ #include <errno.h>
+ #include <time.h>
+@@ -44,6 +45,10 @@
+ #include <stdio.h>
+ #include <xf86drm.h>
+ 
++/* TMD-DEBUG: errno of the last failed dma-buf sync-file ioctl, 0 on success */
++static int tmd_last_errno;
++bool tmd_wsi_log_present; /* TMD-DEBUG: set by wsi_common.c for logged presents */
++
+ static VkResult
+ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
+ {
+@@ -52,6 +57,7 @@ wsi_dma_buf_export_sync_file(int dma_buf_fd, int *sync_file_fd)
+       .fd = -1,
+    };
+    int ret = drmIoctl(dma_buf_fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &export);
++   tmd_last_errno = ret ? errno : 0; /* TMD-DEBUG */
+    if (ret) {
+       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+          return VK_ERROR_FEATURE_NOT_PRESENT;
+@@ -74,6 +80,7 @@ wsi_dma_buf_import_sync_file(int dma_buf_fd, int sync_file_fd)
+       .fd = sync_file_fd,
+    };
+    int ret = drmIoctl(dma_buf_fd, DMA_BUF_IOCTL_IMPORT_SYNC_FILE, &import);
++   tmd_last_errno = ret ? errno : 0; /* TMD-DEBUG */
+    if (ret) {
+       if (errno == ENOTTY || errno == EBADF || errno == ENOSYS) {
+          return VK_ERROR_FEATURE_NOT_PRESENT;
+@@ -104,7 +111,11 @@ wsi_drm_check_dma_buf_sync_file_import_export(const struct wsi_device *wsi,
+ 
+    /* If we don't have dma-buf export, we don't have dma-buf sync, either */
+    VkResult result;
++   const char *tmd_step = "ok"; /* TMD-DEBUG */
++   int tmd_errno = 0;           /* TMD-DEBUG */
++   int tmd_fd = -1;             /* TMD-DEBUG */
+    if (wsi->GetMemoryFdKHR == NULL) {
++      tmd_step = "GetMemoryFdKHR==NULL (wsi->sw?)";
+       result = VK_ERROR_FEATURE_NOT_PRESENT;
+       goto out;
+    }
+@@ -115,6 +126,7 @@ wsi_drm_check_dma_buf_sync_file_import_export(const struct wsi_device *wsi,
+     */
+    if (!(wsi->semaphore_export_handle_types &
+          VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT)) {
++      tmd_step = "semaphore SYNC_FD not exportable";
+       result = VK_ERROR_FEATURE_NOT_PRESENT;
+       goto out;
+    }
+@@ -131,6 +143,7 @@ wsi_drm_check_dma_buf_sync_file_import_export(const struct wsi_device *wsi,
+    result = wsi->AllocateMemory(device, &mem_info, NULL, &mem);
+    if (result != VK_SUCCESS) {
+       mesa_logd("wsi: failed to create memory for dma-buf sync import/export test.");
++      tmd_step = "AllocateMemory(export DMA_BUF, 4096)";
+       goto out;
+    }
+ 
+@@ -143,19 +156,25 @@ wsi_drm_check_dma_buf_sync_file_import_export(const struct wsi_device *wsi,
+    result = wsi->GetMemoryFdKHR(device, &get_info, &fd);
+    if (result != VK_SUCCESS) {
+       mesa_logd("wsi: failed to dma-buf fd for sync import/export test.");
++      tmd_step = "GetMemoryFdKHR(DMA_BUF)";
+       goto free_mem;
+    }
+ 
+    int sync_file;
++   tmd_fd = fd;
+    result = wsi_dma_buf_export_sync_file(fd, &sync_file);
+    if (result != VK_SUCCESS) {
+       mesa_logd("wsi: failed export sync file from dma-buf fd.");
++      tmd_step = "DMA_BUF_IOCTL_EXPORT_SYNC_FILE";
++      tmd_errno = tmd_last_errno;
+       goto free_fd;
+    }
+ 
+    result = wsi_dma_buf_import_sync_file(fd, sync_file);
+    if (result != VK_SUCCESS) {
+       mesa_logd("wsi: failed import sync file to dma-buf fd.");
++      tmd_step = "DMA_BUF_IOCTL_IMPORT_SYNC_FILE";
++      tmd_errno = tmd_last_errno;
+       goto free_sync_file;
+    }
+ 
+@@ -170,6 +189,13 @@ out:
+    /* This is a feature check.  We don't want to return random error codes
+     * from other functions that may call this one, so sanitize it a bit.
+     */
++   /* TMD-DEBUG */
++   tmd_log("wsi selftest dma-buf sync_file import/export: %s (vk=%d) step='%s' "
++           "errno=%d(%s) test_dmabuf_fd=%d sem_export_types=0x%x",
++           result == VK_SUCCESS ? "PASS" : "FAIL", result, tmd_step,
++           tmd_errno, tmd_errno ? strerror(tmd_errno) : "-", tmd_fd,
++           wsi->semaphore_export_handle_types);
++
+    if (result != VK_SUCCESS)
+       result = VK_ERROR_FEATURE_NOT_PRESENT;
+ 
+@@ -201,10 +227,35 @@ wsi_signal_dma_buf_from_semaphore(const struct wsi_swapchain *chain,
+    int sync_file_fd = -1;
+    result = chain->wsi->GetSemaphoreFdKHR(chain->device, &get_fd_info,
+                                           &sync_file_fd);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      if (tmd_wsi_log_present) /* TMD-DEBUG */
++         tmd_log("  semaphore->SYNC_FD export FAILED vk=%d errno=%d", result, errno);
+       return result;
++   }
++
++   /* TMD-DEBUG */
++   char tmd_sem_desc[256] = "";
++   if (tmd_wsi_log_present)
++      tmd_sync_file_desc(sync_file_fd, tmd_sem_desc, sizeof(tmd_sem_desc));
+ 
+    result = wsi_dma_buf_import_sync_file(image->dma_buf_fd, sync_file_fd);
++
++   /* TMD-DEBUG: what does the dma-buf carry right after the import? */
++   if (tmd_wsi_log_present) {
++      int tmd_import_errno = tmd_last_errno;
++      char tmd_buf_desc[256] = "n/a";
++      int tmd_chk = -1;
++      if (wsi_dma_buf_export_sync_file(image->dma_buf_fd, &tmd_chk) == VK_SUCCESS) {
++         tmd_sync_file_desc(tmd_chk, tmd_buf_desc, sizeof(tmd_buf_desc));
++         close(tmd_chk);
++      }
++      tmd_log("  semaphore->SYNC_FD fd=%d %s | IMPORT_SYNC_FILE on dma_buf_fd=%d: "
++              "vk=%d errno=%d(%s) | dma-buf now: %s",
++              sync_file_fd, tmd_sem_desc, image->dma_buf_fd, result,
++              tmd_import_errno, tmd_import_errno ? strerror(tmd_import_errno) : "-",
++              tmd_buf_desc);
++   }
++
+    close(sync_file_fd);
+    return result;
+ }
+@@ -370,13 +421,19 @@ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
+    /* We don't need implicit sync if explicit sync is available through the
+     * window system protocol.
+     */
+-   if (chain->image_info.explicit_sync)
++   if (chain->image_info.explicit_sync) {
++      tmd_log("swapchain %p: explicit sync (DRI3 syncobj), no dma-buf implicit sync", (void *)chain); /* TMD-DEBUG */
+       return VK_SUCCESS;
++   }
+ 
+    VkResult result =
+       wsi_drm_check_dma_buf_sync_file_import_export(chain->wsi, chain->device);
+-   if (result == VK_ERROR_FEATURE_NOT_PRESENT)
++   if (result == VK_ERROR_FEATURE_NOT_PRESENT) {
++      /* TMD-DEBUG */
++      tmd_log("swapchain %p: selftest failed -> NO dma_buf_semaphore; relying on "
++              "driver BO implicit sync (none on kgsl)", (void *)chain);
+       return VK_SUCCESS;
++   }
+ 
+    /* If we got here, all our checks pass.  Create the actual semaphore */
+    const VkExportSemaphoreCreateInfo export_info = {
+@@ -387,9 +444,13 @@ wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain)
+       .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+       .pNext = &export_info,
+    };
+-   return chain->wsi->CreateSemaphore(chain->device, &semaphore_info,
+-                                      &chain->alloc,
+-                                      &chain->dma_buf_semaphore);
++   result = chain->wsi->CreateSemaphore(chain->device, &semaphore_info,
++                                        &chain->alloc,
++                                        &chain->dma_buf_semaphore);
++   /* TMD-DEBUG */
++   tmd_log("swapchain %p: CreateSemaphore(export SYNC_FD) vk=%d dma_buf_semaphore=%s",
++           (void *)chain, result, chain->dma_buf_semaphore ? "yes" : "NULL");
++   return result;
+ }
+ 
+ static VkResult
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 3d2cd7d..b7f24b6 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -472,6 +472,8 @@ wsi_swapchain_present_timing_update_refresh_rate(struct wsi_swapchain *chain,
+ VkResult
+ wsi_prepare_signal_dma_buf_from_semaphore(struct wsi_swapchain *chain,
+                                           const struct wsi_image *image);
++extern bool tmd_wsi_log_present; /* TMD-DEBUG */
++
+ VkResult
+ wsi_signal_dma_buf_from_semaphore(const struct wsi_swapchain *chain,
+                                   const struct wsi_image *image);
+diff --git a/src/vulkan/wsi/wsi_common_x11.c b/src/vulkan/wsi/wsi_common_x11.c
+index a077afe..47f173a 100644
+--- a/src/vulkan/wsi/wsi_common_x11.c
++++ b/src/vulkan/wsi/wsi_common_x11.c
+@@ -63,6 +63,7 @@
+ #include "vk_enum_to_str.h"
+ #include "wsi_common_entrypoints.h"
+ #include "wsi_common_private.h"
++#include "util/tmd_debug.h" /* TMD-DEBUG */
+ #include "wsi_common_queue.h"
+ #include "loader/loader_dri_helper_screen.h"
+ 
+@@ -2522,7 +2523,8 @@ x11_manage_present_queue(void *state)
+ 
+       /* Not necessary to block when we have explicit sync */
+       bool need_fence_wait =
+-            x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) &&
++            (x11_needs_wait_for_fences(chain->base.wsi, wsi_conn, present_mode) ||
++             tmd_force_fence_wait() /* TMD-DEBUG */) &&
+             !chain->base.image_info.explicit_sync;
+ 
+       bool need_timing_fence_wait = x11_swapchain_present_timing_is_out_of_order_completion(
+@@ -3275,6 +3277,29 @@ x11_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+    chain->has_async_may_tear = present_caps & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR;
+    chain->has_reliable_msc = !wsi_conn->is_xwayland;
+ 
++   /* TMD-DEBUG */
++   tmd_log("x11 swapchain %p: %ux%u images=%u sw=%d dri3=%d dri3_modifiers=%d "
++           "dri3_explicit_sync=%d present_caps=0x%x xwayland=%d mit_shm=%d "
++           "same_gpu=%d present_mode=%d wsi_cpu_waits_fence_before_PresentPixmap=%d "
++           "TMD_FORCE_FENCE_WAIT=%d",
++           (void *)chain, pCreateInfo->imageExtent.width,
++           pCreateInfo->imageExtent.height, num_images, wsi_device->sw,
++           wsi_conn->has_dri3, wsi_conn->has_dri3_modifiers,
++#ifdef HAVE_DRI3_EXPLICIT_SYNC
++           wsi_conn->has_dri3_explicit_sync,
++#else
++           -1,
++#endif
++           present_caps, wsi_conn->is_xwayland, wsi_conn->has_mit_shm,
++#ifdef HAVE_X11_DRM
++           wsi_device->sw ? -1 : drm_image_params.same_gpu,
++#else
++           -1,
++#endif
++           (int)present_mode,
++           x11_needs_wait_for_fences(wsi_device, wsi_conn, present_mode),
++           tmd_force_fence_wait());
++
+    /* When images in the swapchain don't fit the window, X can still present them, but it won't
+     * happen by flip, only by copy. So this is a suboptimal copy, because if the client would change
+     * the chain extents X may be able to flip
