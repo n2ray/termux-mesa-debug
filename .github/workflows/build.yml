@@ -9,6 +9,9 @@ name: build-mesa
 
 on:
   push:
+    # documentation-only commits do not need a 20-minute rebuild
+    paths-ignore:
+      - '**.md'
   workflow_dispatch:
 
 permissions:

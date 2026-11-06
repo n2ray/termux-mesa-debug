@@ -9,7 +9,13 @@ variant=$1 out=$2 dist=$3
 PREFIX=/data/data/com.termux/files/usr
 
 mkdir -p "$dist/debs"
-cp -v "$out"/*.deb "$dist/debs/"
+# output/ also contains the dependency .debs that build-package.sh -I downloaded;
+# keep only the packages built from packages/mesa (mesa and its subpackages).
+ver=${MESA_VERSION:?MESA_VERSION not set}
+shopt -s nullglob
+built=("$out"/mesa_"$ver"*_aarch64.deb "$out"/mesa-*_"$ver"*_aarch64.deb)
+[ ${#built[@]} -gt 0 ] || { echo "no mesa $ver debs in $out"; ls "$out"; exit 1; }
+cp -v "${built[@]}" "$dist/debs/"
 
 deb=$(ls "$dist"/debs/mesa-vulkan-icd-freedreno_*_aarch64.deb | head -n1)
 tmp=$(mktemp -d)
