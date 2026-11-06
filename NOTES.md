@@ -2,7 +2,39 @@
 
 ## Status
 
-_STATUS_PLACEHOLDER_
+Last updated 2026-11-06. CI run with all artifacts:
+https://github.com/n2ray/termux-mesa-debug/actions/runs/42209597343 (green).
+
+**Verified (built):**
+* `patches/9000-tmd-debug-wsi-fences.patch` and `patches/fix-9100-kgsl-syncobj-merge.patch`
+  apply to pristine mesa-26.2.6 (sha256 checked) on top of all Termux patches (`patch-check` job).
+* Termux's full `mesa` package for aarch64 builds with them, in Termux's docker builder at the
+  termux-packages commit that is mesa 26.2.6 (`84f9775d`), about 11–17 min per variant. Artifacts:
+  `tmd-vulkan-debug`, `tmd-vulkan-fix` (libvulkan_freedreno.so + side-by-side ICD json, ~2.4 MB),
+  `mesa-debs-debug`, `mesa-debs-fix` (mesa + subpackage debs, reference only). The collect step
+  checks that the TMD instrumentation strings are in the built .so and that the ICD json points to
+  `$PREFIX/opt/tmd/<variant>/libvulkan_freedreno.so`.
+* The same patches compile warning-free in a local x86-64 build of Turnip (kgsl) + X11 WSI.
+* Not run on hardware: there is no phone here, so nothing about runtime behaviour is verified.
+
+**Hypothesis (from reading the code, section 2–4):**
+* On kgsl the fence-attach path is complete: the self-test uses dma-heap memory like the real
+  images, the kgsl semaphore exports SYNC_FD, and `DMA_BUF_IOCTL_IMPORT_SYNC_FILE` goes into the very
+  dma-buf fd the X server receives. I found no step that silently skips the import.
+* The kernel reports a fence that has already signalled as the stub fence, so the server's "100%
+  stub" does not prove that no fence was attached. In MAILBOX mode Mesa CPU-waits for the GPU before
+  PresentPixmap (`wsi_common_x11.c:2529`), and the phone still tore in MAILBOX mode.
+* Most likely (H1): the tearing comes from the server side. Either it marks a buffer idle before its
+  CPU copy is done, or the CPU reads without `DMA_BUF_IOCTL_SYNC` and gets stale cache lines.
+  Alternatives H2–H5 are in section 4; the debug log decides between them.
+* The fix patch corrects a real kgsl fence-merge bug, but nothing shows it causes the tearing.
+
+**Next step for the person:** follow TEST.md. Run vkcube and Chromium with the `debug` driver three
+ways: default, `MESA_VK_WSI_PRESENT_MODE=mailbox`, and `TMD_FORCE_FENCE_WAIT=1`. For each, note
+whether it tears and the LorieNative `dma-buf fences:` line, and send `$PREFIX/tmp/tmd.log`. The
+decisive lines are `wsi selftest ...`, `x11 swapchain ... xwayland= ...`, and the per-present
+`IMPORT_SYNC_FILE ... | dma-buf now: ...`. If tearing persists with `TMD_FORCE_FENCE_WAIT=1`, look
+at the X server's idle/release timing and its `DMA_BUF_IOCTL_SYNC` use, not at Mesa.
 
 ---
 

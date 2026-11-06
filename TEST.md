@@ -19,6 +19,7 @@ Variants (one artifact each):
 ```sh
 pkg install gh            # once; then: gh auth login
 mkdir -p $PREFIX/opt/tmd && cd $PREFIX/tmp
+# latest green run (known good: 42209597343)
 RUN=$(gh run list -R n2ray/termux-mesa-debug -w build-mesa -s success -L 1 --json databaseId -q '.[0].databaseId')
 echo "run: $RUN"
 rm -rf tmd-dl && mkdir tmd-dl
